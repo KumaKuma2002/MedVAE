@@ -1,0 +1,8 @@
+outputs/*
+
+logs/*
+
+ckpt/*
+
+src/wandb/*
+src/__pycache__/
