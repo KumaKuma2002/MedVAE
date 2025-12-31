@@ -12,8 +12,24 @@ import argparse
 import os
 
 """
-KL-VAE, for latent input of SMILE 3D DiT diffusion model.
+This is the inference code for MedVAE, to reconstruct the CT scan
+
+Serving as the preliminary research for
+
+(1) Super-resolution of CT scans
+(2) 3D Volume SMILE diffusion model (3D DiT)
+
+
+References:
+See More, Change Less: Anatomy-Aware Diffusion for Contrast Enhancement
+Junqi Liu, Zejun Wu, Pedro R. A. S. Bassi, Xinze Zhou, Wenxuan Li, Ibrahim E. Hamamci, 
+Sezgin Er, Tianyu Lin, Yi Luo, Szymon Płotka, Bjoern Menze, Daguang Xu, 
+Kai Ding, Kang Wang, Yang Yang, Yucheng Tang, Alan Yuille, Zongwei Zhou★
 """
+
+
+
+
 
 args = argparse.ArgumentParser()
 args.add_argument("--input", type=str, default="/mnt/data/jliu452/Data/Dataset909_UCSF-PDAC-Tumor/BDMAP_00085048/ct.nii.gz", help="Path to the input CT volume (NIfTI).")

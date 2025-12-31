@@ -1,10 +1,10 @@
-export TRAIN_DATA_DIR="/mnt/data/jliu452/Data/Dataset901_SMILE/h5" 
+export TRAIN_DATA_DIR="/mnt/data/jliu452/Data/Dataset801" 
 
 
 
 accelerate launch --num_processes=1 train_klvae.py \
   --train_data_dir=$TRAIN_DATA_DIR \
-  --resume_from_checkpoint="../ckpt/MedVAE_KL-sharp_plain" \
+  --resume_from_checkpoint="/mnt/data/jliu452/MedVAE/outputs/klvae/checkpoint-305000" \
   --validation_images /mnt/data/jliu452/Data/Dataset901_SMILE/h5/baichaoxiao20240416_arterial/ct.h5 \
   --resolution=512 \
   --train_batch_size=1 \
