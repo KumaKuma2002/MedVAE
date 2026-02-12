@@ -55,6 +55,8 @@ import h5py
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from utils_loss import get_segmentation
 
+from utils_discriminator import NLayerDiscriminator, discriminator_hinge_loss, generator_adv_loss
+
 import logging
 def setup_seg_logger(log_dir="../logs"):
     os.makedirs(log_dir, exist_ok=True)
@@ -176,22 +178,36 @@ class HWCarrayToCHWtensor(A.ImageOnlyTransform):
 
 
 def load_CT_slice(ct_path, slice_idx=None):
-    """For AbdomenAtlasPro data: ranging from [-1000, 1000], shape of (H W D) """
-    with h5py.File(ct_path, 'r') as hf:
-        nii = hf['image']
-        z_shape = nii.shape[2]
+    """
+    For AbdomenAtlasPro data: ranging from [-1000, 1000], shape of (H, W, D)
+    On IO error, return zero image of shape (512, 512, 3)
+    """
+    try:
+        with h5py.File(ct_path, 'r') as hf:
+            nii = hf['image']
+            z_shape = nii.shape[2]
 
-        # NOTE: take adjacent 3 slices into the 3 RGB channel
-        if slice_idx is None:
-            slice_idx = random.randint(0, z_shape - 3)   # `random.randint` includes end point
-        # while True:
-        #     try:    # some slices of some CT are broken
-        ct_slice = nii[:, :, slice_idx:slice_idx + 3]   
+            # NOTE: take adjacent 3 slices into the 3 RGB channel
+            if slice_idx is None:
+                slice_idx = random.randint(0, z_shape - 3)
 
-    ct_slice[ct_slice > 1000.] = 1000.    # clipping range and normalize
-    ct_slice[ct_slice < -1000.] = -1000.
-    ct_slice = (ct_slice + 1000.) / 2000.       # [-1000, 1000] --> [0, 1]
-    return ct_slice  # (H W 3)[0, 1]
+            ct_slice = nii[:, :, slice_idx:slice_idx + 3]
+
+        # ---------------- post-processing ---------------- #
+        ct_slice = np.asarray(ct_slice, dtype=np.float32)
+        ct_slice[ct_slice > 1000.] = 1000.
+        ct_slice[ct_slice < -1000.] = -1000.
+        ct_slice = (ct_slice + 1000.) / 2000.  # [0, 1]
+
+        return ct_slice  # (H, W, 3)
+
+    except Exception as e:
+        # ---------------- IO protection ---------------- #
+        # NOTE: MedVAE-safe fallback
+        print(f"[WARNING] Failed to load CT slice from {ct_path}: {e}")
+
+        # Return zero image in normalized range [0, 1]
+        return np.zeros((512, 512, 3), dtype=np.float32)
 
 def seg_to_rgb(seg):
     """
@@ -210,6 +226,9 @@ def seg_to_rgb(seg):
 
 @torch.no_grad()
 def log_validation(model, args, validation_transform, accelerator, seg_model, global_step):
+    from skimage.metrics import structural_similarity as ssim
+    from skimage.metrics import peak_signal_noise_ratio as psnr
+
     def postprocess_log_images(images): # (b c h w)[around 0, 1] tensor float32 -> (b h w c)[0, 255] numpy uint8
         images = (images + 1) / 2
         images = torch.clamp(images, 0.0, 1.0)
@@ -232,7 +251,6 @@ def log_validation(model, args, validation_transform, accelerator, seg_model, gl
             image = image[:3, ...] if image.shape[0] > 3 else image  # in case C > 3
             original_images.append(image[None]) # (3 H W) -> (1 3 H W)
     
-    
     # Generate images
     model.eval()
     images = []
@@ -240,25 +258,49 @@ def log_validation(model, args, validation_transform, accelerator, seg_model, gl
     for original_image in original_images:
         image = accelerator.unwrap_model(model)(original_image).sample
         images.append(image)
-    model.train()
+    
     original_images = torch.cat(original_images, dim=0)
     images = torch.cat(images, dim=0)
 
     images_hu = images
-    print(images_hu.shape)
-    images = postprocess_log_images(images)
-    original_images = postprocess_log_images(original_images)
+    
+    # Process for visualization and metric calculation
+    images_np = postprocess_log_images(images)
+    original_images_np = postprocess_log_images(original_images)
 
-    images = np.concatenate([original_images, images], axis=2)
-    images = [Image.fromarray(np.rot90(image)) for image in images]
+    # Calculate metrics (Average over batch)
+    ssim_values = []
+    psnr_values = []
+    
+    for i in range(len(images_np)):
+        # Calculate on the middle slice (index 1) or full volume depending on needs
+        orig_slice = original_images_np[i, :, :, 1]
+        gen_slice = images_np[i, :, :, 1]
+        
+        val_ssim = ssim(orig_slice, gen_slice, data_range=255)
+        val_psnr = psnr(orig_slice, gen_slice, data_range=255)
+        
+        ssim_values.append(val_ssim)
+        psnr_values.append(val_psnr)
 
-    # segmentation
+    avg_ssim = np.mean(ssim_values)
+    avg_psnr = np.mean(psnr_values)
+
+    # Prepare for visualization (Stacking side-by-side)
+    # Using middle slice for visualization
+    vis_images = []
+    for i in range(len(images_np)):
+        orig = np.rot90(original_images_np[i, :, :, 1])
+        gen = np.rot90(images_np[i, :, :, 1])
+        concat = np.concatenate([orig, gen], axis=1)
+        vis_images.append(Image.fromarray(concat))
+
+    # Segmentation
     seg_model.eval()
     seg_preds = []
     import torch.nn.functional as F
 
     for img in images_hu:
-        # already tensor
         img_t = img.float().to(accelerator.device) # 3 H W, float
         img_t = img_t.unsqueeze(0)   # (1, 3, H, W)
         
@@ -268,40 +310,40 @@ def log_validation(model, args, validation_transform, accelerator, seg_model, gl
             mode="bilinear",
             align_corners=False,
         ).reshape(-1, 1, 512, 512)
-
         
         logits = seg_model(img_t)
         seg = torch.argmax(logits, dim=1)[0].cpu().numpy()
         seg_preds.append(seg)
 
     seg_masks = []
-    seg_overlays = []
-    for i in range(len(images)):
-        seg_masks.append(Image.fromarray(np.rot90(seg_to_rgb(seg_preds[i])))
-        )
+    for i in range(len(seg_preds)):
+        seg_masks.append(Image.fromarray(np.rot90(seg_to_rgb(seg_preds[i]))))
 
-    # Log images
+    # Log images and metrics
     for tracker in accelerator.trackers:
         if tracker.name == "tensorboard":
-            np_images = np.stack([np.asarray(img) for img in images])
-            tracker.writer.add_images("validation", np_images, global_step, dataformats="NHWC")
+            tracker.writer.add_images("validation", np.stack([np.array(img) for img in vis_images]), global_step, dataformats="NHWC")
+            tracker.writer.add_scalar("validation/SSIM", avg_ssim, global_step)
+            tracker.writer.add_scalar("validation/PSNR", avg_psnr, global_step)
+            
         if tracker.name == "wandb":
             tracker.log(
                 {
-                    "validation": [
-                        wandb.Image(image, caption=f"{i}: Original, Generated") for i, image in enumerate(images)
+                    "validation/images": [
+                        wandb.Image(image, caption=f"{i}: Original | Generated") for i, image in enumerate(vis_images)
                     ],
                     "validation/seg_mask": [
                         wandb.Image(img, caption=f"{i}: Seg Mask")
                         for i, img in enumerate(seg_masks)
                     ],
+                    "validation/SSIM": avg_ssim,
+                    "validation/PSNR": avg_psnr,
                 },
                 step=global_step,
             )
-    torch.cuda.empty_cache()
     
-
-    return images
+    torch.cuda.empty_cache()
+    return vis_images
 
 
 def log_grad_norm(model, accelerator, global_step):
@@ -626,7 +668,7 @@ def parse_args():
     )
     parser.add_argument("--seg_model_path", type=str, default=None, help="Path to the nnUNet segmenter model")
     parser.add_argument("--seg_loss_weight", type=float, default=1e-3, help="segmentation loss weight")
-
+    parser.add_argument("--gan_loss_weight", type=float, default=1e-4, help="gan loss weight")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -827,6 +869,18 @@ def main():
         eps=args.adam_epsilon,
     )
 
+    """
+    Include the GAN part
+    """
+    discriminator = NLayerDiscriminator(in_channels=3, ndf=64, n_layers=3).to(accelerator.device)
+    optimizer_d = torch.optim.AdamW(
+        discriminator.parameters(),
+        lr=args.learning_rate, 
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay
+    )
+
+
     ##################################
     # DATLOADER and LR-SCHEDULER     #
     #################################
@@ -970,6 +1024,16 @@ def main():
                 global_step = 0
                 first_epoch = 0
 
+        try:
+            disc_path = os.path.join(args.resume_from_checkpoint, "discriminator.pth")
+            disc_ckpt = torch.load(disc_path, map_location="cpu")
+            accelerator.unwrap_model(discriminator).load_state_dict(disc_ckpt)
+            
+            logger.info(f"Successfully loaded discriminator from {disc_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load discriminator: {e}. Starting from scratch.")
+
+
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     end = time.time()
@@ -1058,20 +1122,19 @@ def main():
                         seg_model, 
                         pixel_values.reshape(b*c, 1, h, w).float(), 
                         )
+                input_labels = torch.argmax(input_image_pred_logits, dim=1).long()
 
                 recon_image_pred_logits = get_segmentation(
                         seg_model, 
                         reconstructed.reshape(b*c, 1, h, w).float(), 
                         )
                 
-                input_labels = torch.argmax(input_image_pred_logits, dim=1).long()                
-                target_labels = torch.argmax(recon_image_pred_logits, dim=1).long()
-                
                 segmentation_loss = F.cross_entropy(
-                    input_image_pred_logits,
-                    target_labels
+                    recon_image_pred_logits, 
+                    input_labels.detach()  # double check
                 )
 
+                target_labels = torch.argmax(recon_image_pred_logits, dim=1).long()
                 seg_logger.info(
                     f"step={global_step} "
                     f"input_organs={sorted(torch.unique(input_labels).tolist())} "
@@ -1079,11 +1142,18 @@ def main():
                 )
 
                 """
+                NOTE additional: add discriminator Loss
+                """
+                adv_loss = generator_adv_loss(discriminator, reconstructed)
+
+                """
                 NOTE: sum up all the losses
                 """
                 reconstruction_loss = recon_loss + perceptual_loss  # "reconstruction loss" in VAE
-                loss = reconstruction_loss + args.kl_weight * kl_loss + args.seg_loss_weight * segmentation_loss
-
+                loss = reconstruction_loss + args.kl_weight * kl_loss + \
+                                            args.seg_loss_weight * segmentation_loss + \
+                                            args.gan_loss_weight * adv_loss
+                
 
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_rec_loss = accelerator.gather(reconstruction_loss.repeat(args.train_batch_size)).float().mean()
@@ -1104,6 +1174,23 @@ def main():
                     ):
                         log_grad_norm(model, accelerator, global_step)
             
+
+            """
+                Update the discriminator
+            """
+            with accelerator.accumulate(discriminator):
+                
+                d_loss = discriminator_hinge_loss(
+                    discriminator, 
+                    pixel_values.detach(), 
+                    reconstructed.detach()
+                )
+                accelerator.backward(d_loss)
+                optimizer_d.step()
+                optimizer_d.zero_grad()
+
+
+
             batch_time_m.update(time.time() - end)
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
@@ -1122,6 +1209,7 @@ def main():
                         "step_rec_loss": avg_rec_loss.item(),
                         "avg_kl_loss": avg_kl_loss.item(),
                         "seg_loss": segmentation_loss.item(),
+                        "gan_loss": adv_loss.item(),
                         "lr": lr_scheduler.get_last_lr()[0],
                         "samples/sec/gpu": samples_per_second_per_gpu,
                         "data_time": data_time_m.val,
@@ -1158,6 +1246,13 @@ def main():
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+
+                        disc_to_save = accelerator.unwrap_model(discriminator)
+                        torch.save(
+                            disc_to_save.state_dict(),
+                            os.path.join(save_path, "discriminator.pth")
+                        )
+                        logger.info(f"Saved discriminator to {save_path}/discriminator.pth")
 
                 # Generate images
                 if global_step % args.validation_steps == 0:

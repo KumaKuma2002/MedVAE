@@ -1,1 +1,0 @@
-python demo_medvae.py --checkpoint "../outputs/klvae/checkpoint-604000"
